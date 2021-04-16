@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -384,6 +385,132 @@ type JobGetter struct {
 
 	// The fields below can be overwritten for tests
 	testStdin io.Reader
+}
+
+func (j *JobGetter) ApiJobs(jpath string) ([]*api.Job, error) {
+	return j.ApiJobsWithArgs(jpath, nil, nil)
+}
+
+func (j *JobGetter) ApiJobsWithArgs(jpath string, vars []string, varfiles []string) ([]*api.Job, error) {
+	destpath := jpath
+
+	switch jpath {
+	case "-":
+		// TODO: handle testing and stdin
+		destpath = "stdin.hcl"
+	case ".":
+		pwd, err := os.Getwd()
+		if err != nil {
+			return nil, err
+		}
+
+		destpath = pwd
+	default:
+		if len(jpath) == 0 {
+			return nil, fmt.Errorf("Error jobfile path has to be specified.")
+		}
+
+		absPath, _ := filepath.Abs(jpath)
+		_, err := os.Stat(absPath)
+		if err != nil && os.IsNotExist(err) {
+			pwd, err := os.Getwd()
+			if err != nil {
+				return nil, err
+			}
+
+			basePath := filepath.Ext(jpath)
+			uri := jpath
+			if basePath == ".hcl" || basePath == ".nomad" {
+				uri = strings.TrimSuffix(jpath, "/"+filepath.Base(jpath))
+				basePath = "/" + filepath.Base(jpath)
+			}
+
+			var client *gg.Client
+			// e.g. nomad-dev run git::https://github.com/hashicorp/video-content.git//nomad-bin-packing-scheduler/nomad_jobs/
+			dst := filepath.Join("/tmp", "nomadjob", fmt.Sprintf("%d", time.Now().Unix()))
+			defer os.Remove(dst)
+
+			client = &gg.Client{
+				Mode:    gg.ClientModeAny,
+				Src:     uri,
+				Pwd:     pwd,
+				Dst:     dst,
+				Options: []gg.ClientOption{},
+			}
+
+			err = client.Get()
+			if err != nil {
+				return nil, fmt.Errorf("Error getting jobfile from %q: %v", uri, err)
+			}
+
+			destpath = dst + basePath
+		}
+	}
+
+	info, err := os.Stat(destpath)
+	if err != nil {
+		return nil, fmt.Errorf("Error reading destination path %q: %v", destpath, err)
+	}
+
+	jobnames := []string{}
+	if info.IsDir() {
+		files, err := ioutil.ReadDir(destpath)
+		if err != nil {
+			return nil, fmt.Errorf("Error reading directory %q: %v", destpath, err)
+		}
+
+		for _, file := range files {
+			if filepath.Ext(file.Name()) == ".hcl" || filepath.Ext(file.Name()) == ".nomad" {
+				jobnames = append(jobnames, path.Join(destpath, file.Name()))
+			}
+		}
+	} else {
+		jobnames = append(jobnames, destpath)
+	}
+
+	jobs := []*api.Job{}
+	for _, jobname := range jobnames {
+		file, err := os.Open(jobname)
+		if err != nil {
+			return nil, fmt.Errorf("Error opening file %q: %v", destpath, err)
+		}
+		defer file.Close()
+
+		// Parse the JobFile
+		var job *api.Job
+		if j.hcl1 {
+			job, err = jobspec.Parse(file)
+			if err != nil {
+				return nil, fmt.Errorf("Error reading job file from %s: %v", destpath, err)
+			}
+		} else {
+			var buf bytes.Buffer
+			_, err = io.Copy(&buf, file)
+			if err != nil {
+				return nil, fmt.Errorf("Error reading job file from %s: %v", destpath, err)
+			}
+			job, err = jobspec2.ParseWithConfig(&jobspec2.ParseConfig{
+				Path:     file.Name(),
+				Body:     buf.Bytes(),
+				ArgVars:  vars,
+				AllowFS:  true,
+				VarFiles: varfiles,
+				Envs:     os.Environ(),
+			})
+
+			if err != nil {
+				if _, merr := jobspec.Parse(&buf); merr == nil {
+					return nil, fmt.Errorf("Failed to parse using HCL 2. Use the HCL 1 parser with `nomad run -hcl1`, or address the following issues:\n%v", err)
+				}
+
+				return nil, err
+			}
+		}
+
+		jobs = append(jobs, job)
+	}
+
+	return jobs, nil
 }
 
 // StructJob returns the Job struct from jobfile.

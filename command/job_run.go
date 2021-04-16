@@ -194,8 +194,8 @@ func (c *JobRunCommand) Run(args []string) int {
 		return 1
 	}
 
-	// Get Job struct from Jobfile
-	job, err := c.JobGetter.ApiJobWithArgs(args[0], varArgs, varFiles)
+	// Get Job structs from Jobfiles
+	jobs, err := c.JobGetter.ApiJobsWithArgs(args[0], varArgs, varFiles)
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error getting job struct: %s", err))
 		return 1
@@ -206,65 +206,6 @@ func (c *JobRunCommand) Run(args []string) int {
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error initializing client: %s", err))
 		return 1
-	}
-
-	// Force the region to be that of the job.
-	if r := job.Region; r != nil {
-		client.SetRegion(*r)
-	}
-
-	// Force the namespace to be that of the job.
-	if n := job.Namespace; n != nil {
-		client.SetNamespace(*n)
-	}
-
-	// Check if the job is periodic or is a parameterized job
-	periodic := job.IsPeriodic()
-	paramjob := job.IsParameterized()
-	multiregion := job.IsMultiregion()
-
-	// Parse the Consul token
-	if consulToken == "" {
-		// Check the environment variable
-		consulToken = os.Getenv("CONSUL_HTTP_TOKEN")
-	}
-
-	if consulToken != "" {
-		job.ConsulToken = helper.StringToPtr(consulToken)
-	}
-
-	if consulNamespace != "" {
-		job.ConsulNamespace = helper.StringToPtr(consulNamespace)
-	}
-
-	// Parse the Vault token
-	if vaultToken == "" {
-		// Check the environment variable
-		vaultToken = os.Getenv("VAULT_TOKEN")
-	}
-
-	if vaultToken != "" {
-		job.VaultToken = helper.StringToPtr(vaultToken)
-	}
-
-	if vaultNamespace != "" {
-		job.VaultNamespace = helper.StringToPtr(vaultNamespace)
-	}
-
-	if output {
-		req := struct {
-			Job *api.Job
-		}{
-			Job: job,
-		}
-		buf, err := json.MarshalIndent(req, "", "    ")
-		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Error converting job: %s", err))
-			return 1
-		}
-
-		c.Ui.Output(string(buf))
-		return 0
 	}
 
 	// Parse the check-index
@@ -283,58 +224,117 @@ func (c *JobRunCommand) Run(args []string) int {
 	opts.PolicyOverride = override
 	opts.PreserveCounts = preserveCounts
 
-	// Submit the job
-	resp, _, err := client.Jobs().RegisterOpts(job, opts, nil)
-	if err != nil {
-		if strings.Contains(err.Error(), api.RegisterEnforceIndexErrPrefix) {
-			// Format the error specially if the error is due to index
-			// enforcement
-			matches := enforceIndexRegex.FindStringSubmatch(err.Error())
-			if len(matches) == 2 {
-				c.Ui.Error(matches[1]) // The matched group
-				c.Ui.Error("Job not updated")
+	for _, job := range jobs {
+		// Parse the Consul token
+		if consulToken == "" {
+			// Check the environment variable
+			consulToken = os.Getenv("CONSUL_HTTP_TOKEN")
+		}
+
+		if consulToken != "" {
+			job.ConsulToken = helper.StringToPtr(consulToken)
+		}
+
+		if consulNamespace != "" {
+			job.ConsulNamespace = helper.StringToPtr(consulNamespace)
+		}
+
+		// Parse the Vault token
+		if vaultToken == "" {
+			// Check the environment variable
+			vaultToken = os.Getenv("VAULT_TOKEN")
+		}
+
+		if vaultToken != "" {
+			job.VaultToken = helper.StringToPtr(vaultToken)
+		}
+
+		if vaultNamespace != "" {
+			job.VaultNamespace = helper.StringToPtr(vaultNamespace)
+		}
+
+		if output {
+			req := struct {
+				Job *api.Job
+			}{
+				Job: job,
+			}
+			buf, err := json.MarshalIndent(req, "", "    ")
+			if err != nil {
+				c.Ui.Error(fmt.Sprintf("Error converting job: %s", err))
 				return 1
 			}
-		}
 
-		c.Ui.Error(fmt.Sprintf("Error submitting job: %s", err))
-		return 1
-	}
-
-	// Print any warnings if there are any
-	if resp.Warnings != "" {
-		c.Ui.Output(
-			c.Colorize().Color(fmt.Sprintf("[bold][yellow]Job Warnings:\n%s[reset]\n", resp.Warnings)))
-	}
-
-	evalID := resp.EvalID
-
-	// Check if we should enter monitor mode
-	if detach || periodic || paramjob || multiregion {
-		c.Ui.Output("Job registration successful")
-		if periodic && !paramjob {
-			loc, err := job.Periodic.GetLocation()
-			if err == nil {
-				now := time.Now().In(loc)
-				next, err := job.Periodic.Next(now)
-				if err != nil {
-					c.Ui.Error(fmt.Sprintf("Error determining next launch time: %v", err))
-				} else {
-					c.Ui.Output(fmt.Sprintf("Approximate next launch time: %s (%s from now)",
-						formatTime(next), formatTimeDifference(now, next, time.Second)))
-				}
+			c.Ui.Output(string(buf))
+		} else {
+			// Force the region to be that of the job.
+			if r := job.Region; r != nil {
+				client.SetRegion(*r)
 			}
-		} else if !paramjob {
-			c.Ui.Output("Evaluation ID: " + evalID)
-		}
 
-		return 0
+			// Force the namespace to be that of the job.
+			if n := job.Namespace; n != nil {
+				client.SetNamespace(*n)
+			}
+
+			// Check if the job is periodic or is a parameterized job
+			periodic := job.IsPeriodic()
+			paramjob := job.IsParameterized()
+			multiregion := job.IsMultiregion()
+
+			// Submit the job
+			resp, _, err := client.Jobs().RegisterOpts(job, opts, nil)
+			if err != nil {
+				if strings.Contains(err.Error(), api.RegisterEnforceIndexErrPrefix) {
+					// Format the error specially if the error is due to index
+					// enforcement
+					matches := enforceIndexRegex.FindStringSubmatch(err.Error())
+					if len(matches) == 2 {
+						c.Ui.Error(matches[1]) // The matched group
+						c.Ui.Error("Job not updated")
+						return 1
+					}
+				}
+
+				c.Ui.Error(fmt.Sprintf("Error submitting job: %s", err))
+				return 1
+			}
+
+			// Print any warnings if there are any
+			if resp.Warnings != "" {
+				c.Ui.Output(
+					c.Colorize().Color(fmt.Sprintf("[bold][yellow]Job Warnings:\n%s[reset]\n", resp.Warnings)))
+			}
+
+			evalID := resp.EvalID
+
+			// Check if we should enter monitor mode
+			if detach || periodic || paramjob || multiregion {
+				c.Ui.Output("Job registration successful")
+				if periodic && !paramjob {
+					loc, err := job.Periodic.GetLocation()
+					if err == nil {
+						now := time.Now().In(loc)
+						next, err := job.Periodic.Next(now)
+						if err != nil {
+							c.Ui.Error(fmt.Sprintf("Error determining next launch time: %v", err))
+						} else {
+							c.Ui.Output(fmt.Sprintf("Approximate next launch time: %s (%s from now)",
+								formatTime(next), formatTimeDifference(now, next, time.Second)))
+						}
+					}
+				} else if !paramjob {
+					c.Ui.Output("Evaluation ID: " + evalID)
+				}
+			} else {
+				// Detach was not specified, so start monitoring
+				mon := newMonitor(c.Ui, client, length)
+				mon.monitor(evalID)
+			}
+		}
 	}
 
-	// Detach was not specified, so start monitoring
-	mon := newMonitor(c.Ui, client, length)
-	return mon.monitor(evalID)
-
+	return 0
 }
 
 // parseCheckIndex parses the check-index flag and returns the index, whether it
